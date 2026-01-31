@@ -1,0 +1,5 @@
+This was written for 12 days, part-time by someone not knowing any web
+development at all. A lot of things are buggy or unfinished. SQL statements
+are not finalized, causing memory leaks. In general, the code here is crappy,
+leaky, and probably has a remote code execution vulnerability. I intend to
+improve it later, but it's the first version that's under version control.

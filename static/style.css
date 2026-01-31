@@ -1,0 +1,74 @@
+body {
+  background-color: darkcyan;
+}
+
+#page-navbar {
+	width: 100%;
+	background-color: darkgreen;
+	border-color: yellowgreen;
+	border-width: 2px;
+	border-style: solid;
+}
+
+#page-navbar form {
+	display: inline;
+}
+
+#site-name {
+	margin: 33px 0 0 10px;
+	font-size: 20px;
+	color: yellowgreen;
+	vertical-align: middle;
+}
+
+#lisp-logo {
+	margin-left: 20px;
+	vertical-align: middle;
+}
+
+.nav-link {
+	color: aliceblue;
+	margin: 0 5px;
+	text-decoration: none;
+}
+
+.nav-link:hover {
+	color: darkgreen;
+	background-color: aliceblue;
+}
+
+.nav-button {
+	color: aliceblue;
+	margin: 0 5px;
+	text-decoration: none;
+	background: none;
+	border: none;
+	font: inherit;
+}
+
+.nav-button:hover {
+	color: darkgreen;
+	background-color: aliceblue;
+}
+
+.nav-span {
+	color: aliceblue;
+	background-color: purple;
+}
+
+#main {
+	margin: 20px 0 0 0;
+}
+
+input:invalid {
+	border-style: dashed;
+	border-color: red;
+}
+
+.error {
+	background-color: pink;
+	width: 240px;
+	border-style: solid;
+	border-color: red;
+	border-width: 1px;
+}
