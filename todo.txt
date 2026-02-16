@@ -6,3 +6,15 @@ category. Still lacks good tag search.
 + Purging such posts is a separate step.
 
 + SQL statements are now finalized.
+
+Currently, search is not fast at all.
++ Added query caching.
+It's not currently obvious if it is good or not, but later I'll see.
+No cache updates on post tag change or post addition now.
++ Made it.
+Old cache entry deletion is yet to be tested.
+
+BUGS:
+Sometimes page load fails with "sqlite: There is nothing left to pop".
+It can be related to the fact I use multithreading with sqlite incorrectly.
+Solution: make the *mem-db* thread-local.

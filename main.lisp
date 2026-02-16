@@ -3,6 +3,7 @@
 
 (in-package #:zimboard)
 
+;; TODO make this per-thread
 (defvar *mem-db* (sqlite:connect "sqlite.db"))
 
 (defvar *tables*
@@ -14,16 +15,33 @@
     ("comments" . "create table comments (id integer primary key, in_post integer, parent_comment integer, msg text, user integer, date integer)")
     ("posts" . "create table posts (id integer primary key, md5 text, complete integer, creation_date integer, posted_by integer)")
     ("tags" . "create table tags (id integer primary key, name text)")
-    ("tags_to_posts" . "create table tags_to_posts (tag_id integer, post_id integer)")))
+    ("tags_to_posts" . "create table tags_to_posts (tag_id integer, post_id integer)")
+    ("cache_entries" . "create table cache_entries (id integer primary key, last_used integer)")
+    ("cache_tags" . "create table cache_tags (cache_id integer, tag_id integer)")
+    ;; TODO should it be like that? Or the creation date rather would be better
+    ;; left only where it already is?
+    ("cache_posts" . "create table cache_posts (cache_id integer, post_id integer, post_creation_date integer)")))
 
 (defvar *table-indices*
   '(("idx_tags_name" . "create index idx_tags_name on tags (name)")
     ("idx_tags_id" . "create index idx_tags_id on tags (id)")
     ("idx_tags_to_posts" . "create index idx_tags_to_posts on tags_to_posts (tag_id, post_id)")
     ("idx_posts_to_tags" . "create index idx_posts_to_tags on tags_to_posts (post_id, tag_id)")
-    ("idx_comments_by_post" . "create index idx_comments_by_post on comments (in_post)")))
+    ("idx_comments_by_post" . "create index idx_comments_by_post on comments (in_post)")
+    ("idx_posts_by_date" . "create index idx_posts_by_date on posts (creation_date)")
+    ("idx_cache_tags_by_tag" . "create index idx_cache_tags_by_tag on cache_tags (tag_id)")
+    ("idx_cache_tags_by_cache" . "create index idx_cache_tags_by_cache on cache_tags (cache_id)")
+    ("idx_cache_posts_by_cache" . "create index idx_cache_posts_by_cache on cache_posts (cache_id)")
+    ("idx_cache_posts_by_post" . "create index idx_cache_posts_by_post on cache_posts (post_id)")
+    ("idx_cache_posts_by_date" . "create index idx_cache_posts_by_date on cache_posts (post_creation_date)")))
 
 (defvar *posts-per-page* 64)
+;; TODO cache priority should probably be more complicated than simply LRU, but
+;; that'll work for now
+(defvar *max-cache-entries* 1024)
+(defvar *teapot-mode* t
+  "A mode for development that responds with 'I'm a
+teapot' to every request coming outside of localhost")
 
 (defun table-exists-p (db name)
   (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
@@ -55,6 +73,11 @@
 (defun clear-uncomplete-posts ()
   (sqlite:execute-non-query *mem-db* "delete from posts where complete=0"))
 
+(defun clear-cache ()
+  (sqlite:execute-non-query *mem-db* "delete from cache_entries")
+  (sqlite:execute-non-query *mem-db* "delete from cache_tags")
+  (sqlite:execute-non-query *mem-db* "delete from cache_posts"))
+
 ;; NOTE that this runs under the assumption a..z and likes are sequential in the codespace
 (defun latin-char-p (c)
   (or (<= (char-code #\a) (char-code c) (char-code #\z))
@@ -64,10 +87,10 @@
   (<= (char-code #\0) (char-code c) (char-code #\9)))
 
 (defun white-char-p (c)
-  (or (eql c #\Tab)
-      (eql c #\Newline)
-      (eql c #\Return)
-      (eql c #\Space)))
+  (or (char= c #\Tab)
+      (char= c #\Newline)
+      (char= c #\Return)
+      (char= c #\Space)))
 
 (defun int-to-hex (n)
   "Returns the corresponding hex character for n in range 0-15 included"
@@ -131,7 +154,7 @@
             (adjust-array a (+ 1024 (length a))))
           (setf (aref a l) y)
           (incf l)
-          (when (and (eql y 10) (>= l 2) (eql (aref a (- l 2)) 13))
+          (when (and (= y 10) (>= l 2) (= (aref a (- l 2)) 13))
             (return (adjust-array a l))))
         finally (return (adjust-array a l))))
 
@@ -230,8 +253,8 @@
                 (cond
                   ((and (white-char-p i) (= cpos ix))
                    (incf cpos))
-                  ((eql i sep) (finish ix) (setf cpos (1+ ix)))
-                  ((eql i #\=) (unless cur-name
+                  ((char= i sep) (finish ix) (setf cpos (1+ ix)))
+                  ((char= i #\=) (unless cur-name
                          (setf cur-name (subseq l cpos ix)
                                cpos (1+ ix))))
                   (t nil))
@@ -242,20 +265,28 @@
   (declare (type list head))
   (let ((status (getf head :status 200))
         (use-navbar (getf head :use-navbar t))
+        (use-head (getf head :use-head t))
         (output (getf head :output))
         (args (getf head :args))
         (title (getf head :title)))
-    (declare (type symbol args))
+    ;(declare (type symbol args))
     (declare (type symbol output))
     `(list
        ,status '(:content-type "text/html")
        (list
          (with-html-output-to-string
            (,output nil :prologue t)
+           (setf (cl-who:html-mode) :html5)
            (:html
-             (:head (:title ,title)
-                    (:link :rel "stylesheet"
-                           :href "/static/style.css"))
+           ,(if use-head
+              `(:head (:title ,title)
+                      (:meta :charset "utf-8")
+                      (:link :rel "icon"
+                             :type "image/png"
+                             :href "/favicon.png")
+                      (:link :rel "stylesheet"
+                             :href "/static/style.css"))
+              `(:head))
              ,(if use-navbar
                 `(:body (page-navbar ,output (first (getf ,args :deduced-user)))
                         ,(nconc (list :div :id "main")
@@ -265,8 +296,7 @@
 (defun page-error-div (output str)
   (with-html-output
     (output)
-    (:div :class "error"
-          (:span (format output "~A" str)))))
+    (:p :class "error" (format output "~A" str))))
 
 (defparameter *page-error-kinds*
   '(("i" . "Invalid username")
@@ -301,20 +331,21 @@
 (defun page-navbar (p &optional logged-as)
   (with-html-output
     (p)
-    (:nav :id "page-navbar"
-          (:a :class "nav-link" :href "/" "Home")
-          (:a :class "nav-link" :href "/search" "Search")
-          (:a :class "nav-link" :href "/post" "Make a post")
+    (:div :id "page-navbar"
+          (:a :class "nav-link" :href "/" "Home") " "
+          (:a :class "nav-link" :href "/search" "Search") " "
+          (:a :class "nav-link" :href "/post" "Make a post") " "
           (if logged-as
             (with-html-output
               (p)
               (:span :class "nav-span"
-                     (format p "user/~A" logged-as))
+                     (format p "user/~A" logged-as)) " "
               (:form :method "post" :action "/delete-session"
                      (:input :class "nav-button" :type "submit" :value "Log out")))
             (with-html-output
               (p)
               (:a :class "nav-link" :href "/register" "Register")
+              " "
               (:a :class "nav-link" :href "/login" "Login"))))))
 
 (defun page-home (args)
@@ -344,19 +375,19 @@
         for ix from 0 do
         (case state
           (1 (cond
-               ((eql #\: i) (setf state 2))
-               ((not (eql (elt compar ix) i))
+               ((char= #\: i) (setf state 2))
+               ((not (char= (elt compar ix) i))
                 (return))))
           (2 (cond
-               ((eql #\; i) (setf (fill-pointer this-name) 0))
-               ((eql #\= i)
+               ((char= #\; i) (setf (fill-pointer this-name) 0))
+               ((char= #\= i)
                 (when (string-equal this-name "name")
                   (setf state 3)))
-               ((not (eql #\Space i)) (vector-push i this-name))))
+               ((not (char= #\Space i)) (vector-push i this-name))))
           (3 (cond
-               ((or (eql #\; i)
-                    (eql #\Newline i)
-                    (eql #\Return i))
+               ((or (char= #\; i)
+                    (char= #\Newline i)
+                    (char= #\Return i))
                 (return result))
                (t (vector-push i result)))))
         finally (return result)))
@@ -395,10 +426,38 @@
       (loop for i across s
             for ix from 0 do
             (when (or (white-char-p i)
-                      (eql i #\,))
+                      (char= i #\,))
               (finish ix))
             finally (progn (finish (length s))
                            (return (nreverse r)))))))
+
+(defun mark-used-cache (cache-id)
+  (sqlite:execute-non-query
+    *mem-db* "update cache_entries set last_used=? where id=?"
+    (get-universal-time) cache-id))
+
+(defun purge-old-cache (n)
+  "Remove N least recently used entries"
+  (sqlite:execute-non-query
+    *mem-db* "delete top ? from cache_entries order by last_used asc" n))
+
+(defun update-cache (post-id)
+  "Update all query caches related to post-id."
+  (let ((ncache (sqlite:execute-single *mem-db* "select count() from cache_entries;")))
+    (when (> ncache *max-cache-entries*)
+      (purge-old-cache (- ncache *max-cache-entries*))))
+  (sqlite:execute-non-query *mem-db* "delete from cache_posts where post_id=?" post-id)
+  (let ((post-date (sqlite:execute-single *mem-db* "select creation_date from posts where id=?" post-id))
+        (tags (mapcar #'car (sqlite:execute-to-list *mem-db* "select tag_id from tags_to_posts where post_id=?" post-id))))
+    (sqlite:execute-non-query/named
+      *mem-db*
+      (format nil
+"insert into cache_posts (cache_id, post_id, post_creation_date)
+select cache_id, :post_id, :post_date from cache_entries
+join cache_tags on cache_entries.id=cache_tags.cache_id
+group by cache_entries.id
+having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~}) then 1 end)" tags)
+      ":post_id" post-id ":post_date" post-date)))
 
 (defun page-post-create (args)
   (let ((parsed (parse-multipart (getf args :body)))
@@ -419,7 +478,7 @@
                  page-post-create
                  `(303 (:content-type "text/plain"
                         :location ,(format nil "/post?e=~A" text))
-                   (format nil "ERROR: ~A" text)))))
+                   nil))))
       (unless user-id
         (l-error "pm"))
       (when (zerop (length image-body))
@@ -427,8 +486,8 @@
       (let* ((clean-body (or (magick-util:make-clean-blob (copy-seq image-body))
                              (l-error "pi")))
              (hash (array-to-hex (md5:md5sum-sequence clean-body))))
-        ;; Was seemingly breaking on hashes starting with [digits]e... because of automatic type converison
-        ;; FIXed by changing the type from non-existant 'string' to 'text'
+        ;; Was seemingly breaking on hashes starting with [digits]e... because of automatic type conversion
+        ;; FIXed by changing the type from the non-existent 'string' to 'text'
         (sqlite:execute-non-query
           *mem-db* "insert into posts (complete, md5, creation_date, posted_by) values (0, ?, ?, ?)"
           hash (get-universal-time) user-id)
@@ -440,22 +499,22 @@
                                   :direction :output
                                   :element-type '(unsigned-byte 8)
                                   :if-exists nil)
-            (cond
-              (orig-f
-                (loop for i across clean-body
-                      do (write-byte i orig-f)))
-              (t (l-error "ps"))))
+            (if orig-f
+              (loop for i across clean-body
+                    do (write-byte i orig-f))
+              (l-error "ps")))
           (let ((preview-name (format nil "./imgs/~A" (image-preview-path cur-id))))
             (ensure-directories-exist (directory-namestring preview-name))
             (unless (magick-util:make-thumbnail
                       clean-body
                       128 128
                       preview-name)
-              (l-error "pp"))
-            (loop for i in (parse-tags (flexi-streams:octets-to-string tags)) do
-                  (sqlite:execute-non-query
-                    *mem-db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
-                    (tagname-to-id i *mem-db* :create-if-missing t) cur-id)))
+              (l-error "pp")))
+          (loop for i in (parse-tags (flexi-streams:octets-to-string tags)) do
+                (sqlite:execute-non-query
+                  *mem-db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
+                  (tagname-to-id i *mem-db* :create-if-missing t) cur-id))
+          (update-cache cur-id)
           (sqlite:execute-non-query
             *mem-db* "update posts set complete=1 where id=?" cur-id)
           `(303 (:content-type "text/plain" :location ,(format nil "/id/~D" cur-id))
@@ -465,7 +524,11 @@
   (simple-page
     (:title "Make a post" :args args :output output)
     (page-error-case output (gethash "e" (getf args :query-parsed)))
-    (page-post-input output)))
+    (if (car (getf args :deduced-user))
+      (page-post-input output)
+      (with-html-output
+        (output)
+        (:p :class "note" "Only logged users can post")))))
 
 (defun page-register (args)
   (let ((qp (parse-simple (getf args :query))))
@@ -510,7 +573,7 @@
                (setf cpos (1+ pos))))
       (loop for i across s
             for ix from 0 do
-            (when (eql i #\+) (finish ix))
+            (when (white-char-p i) (finish ix))
             finally (progn (finish (length s))
                            (return (nreverse r)))))))
 
@@ -520,7 +583,7 @@
 (defun collect-post-tags (post-id)
   ;; TODO improve perf if needed
   (mapcar #'car (sqlite:execute-to-list
-                  *mem-db* "select tags.name from tags_to_posts inner join tags where tags_to_posts.post_id=? and tags.id=tags_to_posts.tag_id" post-id)))
+                  *mem-db* "select tags.name from tags_to_posts inner join tags on tags.id=tags_to_posts.tag_id where tags_to_posts.post_id=?" post-id)))
 
 (defun print-date (d)
   (multiple-value-bind (second minute hour date month year day daylight-p zone)
@@ -533,7 +596,7 @@
     (sqlite:execute-one-row-m-v
       *mem-db* "select id, md5, creation_date, posted_by from posts where id=?" post-id)
     (when id
-      (format p "<p>id:~D md5:~A date:(~A) posted_by:~A tags:~{~S~^, ~}</p><img src=\"/imgs/~A\">"
+      (format p "<p>id:~D md5:~A date:(~A) posted_by:~A tags:~{~S~^, ~}</p><img src=\"/imgs/~A\" alt=\"post image\">"
               id md5 (print-date date)
               (id-to-username by)
               (collect-post-tags post-id)
@@ -552,7 +615,7 @@
         finally (sqlite:finalize-statement stmt)))
 
 (defun page-display-post-preview (p post-id)
-  (format p "<article class=\"article-preview\"><a href=\"/id/~D\"><img src=\"/imgs/~A\"><span>post #~A</span></a></article>"
+  (format p "<article class=\"article-preview\"><a href=\"/id/~D\"><img src=\"/imgs/~A\" alt=\"post image\"><h3>post #~A</h3></a></article>"
           post-id (image-preview-path post-id) post-id))
 
 (defun post-matches-tag-p (post-id tag-id)
@@ -561,44 +624,133 @@
 (defun post-matches-tags-p (id x)
   (loop for i in x always (post-matches-tag-p id i)))
 
+(defun page-search-list-null (p page-begin number)
+  (loop with stmt =
+        (sqlite:prepare-statement
+          *mem-db* "select id from posts order by creation_date desc limit ? offset ?")
+        initially
+        (progn
+          (sqlite:bind-parameter stmt 1 number)
+          (sqlite:bind-parameter stmt 2 page-begin))
+        while (sqlite:step-statement stmt)
+        do (page-display-post-preview
+             p (sqlite:statement-column-value stmt 0))
+        finally (sqlite:finalize-statement stmt))
+  (sqlite:execute-single *mem-db* "select count() from posts"))
+
+(defun page-search-list-single (p tags page-begin number)
+  (loop with stmt =
+        (sqlite:prepare-statement
+          *mem-db*
+          "select posts.id from posts join tags_to_posts on posts.id=tags_to_posts.post_id where tags_to_posts.tag_id = ? order by posts.creation_date desc limit ? offset ?")
+        initially
+        (progn
+          (sqlite:bind-parameter stmt 1 (car tags))
+          (sqlite:bind-parameter stmt 2 number)
+          (sqlite:bind-parameter stmt 3 page-begin))
+        while (sqlite:step-statement stmt)
+        do (page-display-post-preview
+             p (sqlite:statement-column-value stmt 0))
+        finally (sqlite:finalize-statement stmt))
+  (sqlite:execute-single *mem-db* "select count() from tags_to_posts where tag_id = ?" (car tags)))
+
+(defun build-cached-check (tags)
+  (format nil "select cache_entries.id from cache_entries join cache_tags on cache_entries.id=cache_tags.cache_id group by cache_tags.cache_id having count(*) = ~D and count(case when cache_tags.tag_id in (~{~D~^,~}) then 1 end) = ~D" (length tags) tags (length tags)))
+
+(defun search-query-cached-p (tags)
+  "Returns the ID of the cache entry matching TAGS exactly. In
+case such entry doesn't exist, returns nil"
+  (sqlite:execute-single *mem-db* (build-cached-check tags)))
+
+(defun build-cache-creation (tags)
+  (format nil
+"insert into cache_posts (cache_id, post_id, post_creation_date)
+select :cache_id, posts.id, posts.creation_date from posts
+join tags_to_posts as tags1 on posts.id=tags1.post_id
+join tags_to_posts on posts.id=tags_to_posts.post_id
+where tags1.tag_id=:smallest_tag
+and tags_to_posts.tag_id in (~{~D~^,~})
+group by posts.id
+having count(distinct tags_to_posts.tag_id) = :tag_count"
+          tags))
+
+(defun create-cache-entry (tags)
+  (sqlite:execute-non-query
+    *mem-db* "insert into cache_entries (last_used) values (?)"
+    (get-universal-time))
+  (let ((id (sqlite:last-insert-rowid *mem-db*)))
+    (dolist (i tags)
+      (sqlite:execute-non-query
+        *mem-db* "insert into cache_tags (cache_id, tag_id) values (?, ?)"
+        id i))
+    id))
+
+(defun search-query-cache (tags)
+  "Cache a search query. Is quite slow"
+  (assert (< 0 (length tags)))
+  (let ((ctag (car tags)))
+    ;; TODO rewrite this into a query
+    (loop with ccount = (tag-count ctag)
+          for i in (cdr tags) do
+          (let ((y (tag-count i)))
+            (when (< y ccount)
+              (setf ccount y
+                    ctag i))))
+    (let ((cache-id (create-cache-entry tags)))
+      (sqlite:execute-non-query/named
+        *mem-db* (build-cache-creation tags)
+        ":cache_id" cache-id
+        ":smallest_tag" ctag
+        ":tag_count" (length tags))
+      cache-id)))
+
+(defun page-search-list-cached (p cache-id page-begin number)
+  ;; TODO
+  (mark-used-cache cache-id)
+  (loop with stmt = (sqlite:prepare-statement *mem-db* "select post_id from cache_posts where cache_id=? order by post_creation_date desc limit ? offset ?")
+        initially
+        (progn
+          (sqlite:bind-parameter stmt 1 cache-id)
+          (sqlite:bind-parameter stmt 2 number)
+          (sqlite:bind-parameter stmt 3 page-begin))
+        while (sqlite:step-statement stmt)
+        do (page-display-post-preview p (sqlite:statement-column-value stmt 0))
+        finally (sqlite:finalize-statement stmt)))
+
 (defun page-search-list (p s page)
+  ;; TODO write caching
   ;; TODO make it start from either the top or the bottom
-  (let ((page-begin (* page *posts-per-page*))
-        (page-end (* (1+ page) *posts-per-page*))
-        (x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) (parse-search-query s))))
-    (let ((ctag nil))
-      (loop with ccount = 100000000
-            for i in x do
-            (let ((y (tag-count i)))
-              (when (< y ccount)
-                (setf ccount y
-                      ctag i))))
-      (if (or ctag (null x))
-        (loop with cur = 0
-              with stmt =
-              (if (null x)
-                (sqlite:prepare-statement *mem-db* "select id from posts order by creation_date desc")
-                (let ((stmt1 (sqlite:prepare-statement *mem-db* "select posts.id from posts inner join tags_to_posts where tags_to_posts.post_id=posts.id and tags_to_posts.tag_id=? order by posts.creation_date desc")))
-                  (sqlite:bind-parameter stmt1 1 ctag)
-                  stmt1))
-              ; while (< cur page-end)
-              while (sqlite:step-statement stmt)
-              when (post-matches-tags-p (sqlite:statement-column-value stmt 0) (cdr x))
-              do (progn
-                   (when (<= page-begin cur (1- page-end))
-                     (page-display-post-preview p (sqlite:statement-column-value stmt 0)))
-                   (incf cur))
-              finally (progn
-                        (sqlite:finalize-statement stmt)
-                        (return cur)))
-        0))))
+  (let* ((page-begin (* page *posts-per-page*))
+         (query-parsed (parse-search-query s))
+         (x (mapcar (lambda (name) (tagname-to-id name *mem-db*)) query-parsed)))
+    (cond
+      ((some #'null x)
+       (values
+         nil
+         (format
+           nil "nonexistent tags: ~{~A~^, ~}"
+           (loop for i in x
+                 for j in query-parsed
+                 unless i
+                 collect j))))
+      ((null x)
+       (page-search-list-null p page-begin *posts-per-page*))
+      ((= 1 (length x))
+       (page-search-list-single p x page-begin *posts-per-page*))
+      (t
+       (let ((cache-id
+               (or (search-query-cached-p x)
+                   (search-query-cache x))))
+         (page-search-list-cached p cache-id page-begin *posts-per-page*))
+       0))))
 
 (defun page-search (args)
   (let* ((qp (getf args :query-parsed))
          (s (percent-decode (gethash "s" qp "")))
-         (page (or (parse-integer s :junk-allowed t)
+         (page (or (parse-integer (gethash "p" qp "") :junk-allowed t)
                    0))
-         (post-count nil))
+         (post-count nil)
+         (error-text nil))
     (simple-page
       (:title "Search" :args args :output output)
       (:form :action "/search"
@@ -606,16 +758,22 @@
              (:input :id "s" :name "s" :type "text" :placeholder "empty"
                      :value (escape-string s)))
       (:div :id "post-list"
-            (setf post-count (page-search-list output s page)))
+            (multiple-value-setq (post-count error-text)
+              (page-search-list output s page)))
       (:ul
         :class "page-list"
-        (unless (zerop page)
+        (when post-count
+          (unless (zerop page)
+            (with-html-output (output)
+              (:li (:a :href (format nil "/search?s=~A&p=~D" s (1- page)) "<-"))))
+          (loop for i from 0 to (floor (1- post-count) *posts-per-page*) do
+                (with-html-output (output)
+                  (:li (:a :href (format nil "/search/?s=~A&p=~D" s i)
+                           (format output "[~D]" i))))))
+        (when error-text
           (with-html-output (output)
-            (:li (:a :href (format nil "/search?s=~A&p=~D" s (1- page)) "<-"))))
-        (loop for i from 0 to (floor (1- post-count) *posts-per-page*) do
-              (with-html-output (output)
-                (:li (:a :href (format nil "/search/?s=~A&p=~D" s i)
-                         (format output "[~D]" i)))))))))
+            (:p :class "note"
+                (format output "It appears that you have made an invalid request: ~A" error-text))))))))
 
 (defun valid-username-p (name)
   "Username is valid whenever it is at least 3 characters short and
@@ -624,9 +782,9 @@ consists only of Latin script, numerics, and any of [._-]"
        (loop for i across name
              always (or (latin-char-p i)
                         (numer-char-p i)
-                        (eql #\. i)
-                        (eql #\_ i)
-                        (eql #\- i)))))
+                        (char= #\. i)
+                        (char= #\_ i)
+                        (char= #\- i)))))
 
 (defun invalid-username-p (name)
   (not (valid-username-p name)))
@@ -686,7 +844,7 @@ consists only of Latin script, numerics, and any of [._-]"
 
 (defun get-cookie-user (cookie-parsed)
   (sqlite:execute-one-row-m-v
-    *mem-db* "select users.name, users.id from sessions inner join users where sessions.id=? and users.id=sessions.user_id"
+    *mem-db* "select users.name, users.id from sessions inner join users on users.id=sessions.user_id where sessions.id=?"
     (gethash "session" cookie-parsed)))
 
 (defun delete-session-by-id (session)
@@ -734,9 +892,9 @@ consists only of Latin script, numerics, and any of [._-]"
           (c (parse-integer (or id-s "") :junk-allowed t)))
      (cond
        ((and c (post-exists c))
-        (page-display-post output c)
         (with-html-output (output)
           (:a :href (format nil "/id/~D/edit-tags" c) "Edit tags"))
+        (page-display-post output c)
         (format output "<div class=\"comments\">")
         (page-display-comments output c)
         (format output "</div>")
@@ -782,7 +940,7 @@ consists only of Latin script, numerics, and any of [._-]"
                (return-from
                  page-id-post-tags
                  `(303 (:location ,(format nil "/id/~D/edit-tags?e=~A" c text))
-                   (format nil "ERROR: ~A" text)))))
+                       nil))))
     (cond
       ((not (first (getf args :deduced-user)))
        (l-error "em"))
@@ -796,6 +954,7 @@ consists only of Latin script, numerics, and any of [._-]"
          (sqlite:execute-non-query
            *mem-db* "insert into tags_to_posts (post_id, tag_id) values (?, ?)"
            c (tagname-to-id i *mem-db* :create-if-missing t)))
+       (update-cache c)
        `(303 (:location ,(format nil "/id/~D" c))
          nil))))))
 
@@ -806,8 +965,9 @@ consists only of Latin script, numerics, and any of [._-]"
          (user-id (second (getf args :deduced-user))))
     (labels ((l-error (text)
                (return-from page-post-comment
-                 (list 303 `(:content-type "text/plain"
-                             :location ,(format nil "/~{~A~^/~}?e=~A" (butlast path-s) text))))))
+                 `(303 (:content-type "text/plain"
+                        :location ,(format nil "/~{~A~^/~}?e=~A" (butlast path-s) text))
+                       nil))))
       (unless post-id (l-error "ci"))
       (unless (post-exists post-id) (l-error "ci"))
       (unless user-id (l-error "cm"))
@@ -822,10 +982,15 @@ consists only of Latin script, numerics, and any of [._-]"
 
 (defun static-directory (args)
   ;; TODO figure out a more safe/better way to serve files
+  ;; TODO figure out if I even need this crap
   (when (notany (lambda (x) (or (string= "." x)
                                 (string= ".." x)))
                 (getf args :path-s))
     (pathname (format nil "./~{~A~^/~}" (getf args :path-s)))))
+
+(defun static-favicon (args)
+  (declare (ignore args))
+  #P"./static/favicon.png")
 
 (defun page-notfound (args)
   (list 404 '(:content-type "text/plain")
@@ -858,7 +1023,8 @@ consists only of Latin script, numerics, and any of [._-]"
     (page-logout       :post ("delete-session"))
     (page-post-comment :post ("id" :any "comment"))
     (static-directory  :get  ("static" :any*))
-    (static-directory  :get  ("imgs" :any*))))
+    (static-directory  :get  ("imgs" :any*))
+    (static-favicon    :get  ("favicon.png"))))
 
 (defun route (method path-s)
   (loop for i in *route-paths*
@@ -889,6 +1055,13 @@ consists only of Latin script, numerics, and any of [._-]"
          (method (getf env :request-method))
          (cookie (cdr (assoc :cookie (getf env :headers))))
          (cookie-parsed (parse-simple cookie #\;)))
+    (when (and *teapot-mode*
+               (not (equalp "127.0.0.1" (hunchentoot:remote-addr*))))
+      (return-from page-entry
+        (simple-page
+          (:title "Zimboard" :args '() :output output :status 418
+           :use-navbar nil :use-head nil)
+          (:p :class "note" "I'm a teapot"))))
     (funcall (route method path-s)
              (list :query query
                    :body body
@@ -927,10 +1100,14 @@ consists only of Latin script, numerics, and any of [._-]"
                     :headers headers)))
     (let ((response (page-entry env)))
       (typecase response
+        (null nil)
         (pathname
          (hunchentoot:handle-static-file response))
         (list
          (destructuring-bind (status headers &optional content) response
+           (declare (type integer status)
+                    (type list headers)
+                    (type list content))
            (setf (hunchentoot:return-code*) status)
            (setf (hunchentoot:content-type*) (getf headers :content-type))
            ;; TODO figure out if cookies should be processed separately. The hunchentoot manual says so, but it still works(?)

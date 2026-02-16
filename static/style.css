@@ -14,21 +14,9 @@ body {
 	display: inline;
 }
 
-#site-name {
-	margin: 33px 0 0 10px;
-	font-size: 20px;
-	color: yellowgreen;
-	vertical-align: middle;
-}
-
-#lisp-logo {
-	margin-left: 20px;
-	vertical-align: middle;
-}
-
 .nav-link {
 	color: aliceblue;
-	margin: 0 5px;
+	padding: 0px 5px;
 	text-decoration: none;
 }
 
@@ -39,7 +27,7 @@ body {
 
 .nav-button {
 	color: aliceblue;
-	margin: 0 5px;
+	padding: 0px 5px;
 	text-decoration: none;
 	background: none;
 	border: none;
@@ -108,7 +96,7 @@ input:invalid {
 .article-preview a img {
 	margin: auto auto;
 }
-.article-preview a span {
+.article-preview a h3 {
 	margin: auto auto;
 }
 
