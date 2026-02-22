@@ -51,7 +51,7 @@ body {
 #post-list {
 	margin-top: 10px;
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+	grid-template-columns: repeat(auto-fill, 200px);
 }
 
 input:invalid {
@@ -107,4 +107,30 @@ input:invalid {
 .page-list li {
 	display: inline;
 	margin: 0 5px;
+}
+
+.page-list a {
+	color: pink;
+	outline: solid 1px red;
+	text-decoration: none;
+}
+
+.page-list a:hover {
+	color: red;
+	outline: solid 1px pink;
+	text-decoration: none;
+}
+
+.page-list .cur-page-link {
+	color: purple;
+	outline: solid 1px blue;
+}
+
+.page-list .cur-page-link:hover {
+	color: blue;
+	outline: solid 1px purple;
+}
+
+.username {
+	color: aliceblue;
 }

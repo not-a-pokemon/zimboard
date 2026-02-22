@@ -42,6 +42,7 @@
 (defvar *teapot-mode* t
   "A mode for development that responds with 'I'm a
 teapot' to every request coming outside of localhost")
+(defvar *tags-per-page* 128)
 
 (defun table-exists-p (db name)
   (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
@@ -98,6 +99,11 @@ teapot' to every request coming outside of localhost")
     (code-char (+ 48 n))
     (code-char (+ 87 n))))
 
+(defun int-to-hex-upcase (n)
+  (if (< n 10)
+    (code-char (+ 48 n))
+    (code-char (+ 55 n))))
+
 (defun hex-to-int (c &optional (default -1))
   (cond
     ((numer-char-p c) (- (char-code c) (char-code #\0)))
@@ -138,8 +144,23 @@ teapot' to every request coming outside of localhost")
                   (write-char c result)
                   (incf i))))))))
 
-; (defvar *percent-non-encoded* "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~.")
-;TODO (defun percent-encode (string))
+(defvar *percent-non-encoded* "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~.")
+(defun percent-encode (str)
+  ;; TODO perf
+  (with-output-to-string (result)
+    (loop for i across str do
+          (cond
+            ((position i *percent-non-encoded*)
+             (write-char i result))
+            ((char= #\Space i)
+             (write-char #\+ result))
+            (t
+              (write-char #\% result)
+              (write-char (int-to-hex-upcase (ash (char-code i) -4))
+                          result)
+              (write-char (int-to-hex-upcase (logand #xF (char-code i)))
+                          result))))
+    result))
 
 ;; TODO should have I used a fill pointer here?
 (defun read-till-rn (r)
@@ -312,7 +333,8 @@ teapot' to every request coming outside of localhost")
     ("cm" . "Must be logged in in order to comment")
     ("ci" . "Invalid post id")
     ("em" . "Must be logged in in order to edit tags")
-    ("ej" . "Stop sending junk to the server, dumbass")))
+    ("ej" . "Stop sending junk to the server, dumbass")
+    ("et" . "Invalid tagnames")))
 
 (defun page-error-case (output error-kind)
   (loop for i in *page-error-kinds*
@@ -335,6 +357,7 @@ teapot' to every request coming outside of localhost")
           (:a :class "nav-link" :href "/" "Home") " "
           (:a :class "nav-link" :href "/search" "Search") " "
           (:a :class "nav-link" :href "/post" "Make a post") " "
+          (:a :class "nav-link" :href "/list-tags" "Tag list") " "
           (if logged-as
             (with-html-output
               (p)
@@ -409,7 +432,23 @@ teapot' to every request coming outside of localhost")
           (subseq hash 2 4)
           (subseq hash 4)))
 
+(defun valid-tagname-p (name)
+  (loop for i across name
+        always (or (latin-char-p i)
+                   (numer-char-p i)
+                   (case i
+                     (#\. t)
+                     (#\_ t)
+                     (#\- t)
+                     (#\( t)
+                     (#\) t)
+                     (#\' t)
+                     (#\% t)
+                     (#\~ t)
+                     (otherwise nil)))))
+
 (defun tagname-to-id (name &key create-if-missing)
+  ;; TODO check for name validity
   (or (sqlite:execute-single *db* "select id from tags where name=?" name)
       (when create-if-missing
         (sqlite:execute-non-query
@@ -464,14 +503,16 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
         (image-body nil)
         (tags nil)
         (cur-id nil)
-        (user-id (username-to-id (first (getf args :deduced-user)))))
+        (user-id (username-to-id (first (getf args :deduced-user))))
+        (parsed-tags nil))
     (dolist (i parsed)
       (let ((x (multipart-pull-out-name (getf i :headers))))
         (cond
           ((string-equal "\"image\"" x)
            (setf image-body (getf i :body)))
           ((string-equal "\"tags\"" x)
-           (setf tags (getf i :body))))))
+           (setf tags (getf i :body)
+                 parsed-tags (parse-tags (flexi-streams:octets-to-string tags)))))))
     (labels ((l-error
                (text)
                (return-from
@@ -483,6 +524,8 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
         (l-error "pm"))
       (when (zerop (length image-body))
         (l-error "pn"))
+      (unless (every #'valid-tagname-p parsed-tags)
+        (l-error "et"))
       (let* ((clean-body (or (magick-util:make-clean-blob (copy-seq image-body))
                              (l-error "pi")))
              (hash (array-to-hex (md5:md5sum-sequence clean-body))))
@@ -510,7 +553,7 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
                       128 128
                       preview-name)
               (l-error "pp")))
-          (loop for i in (parse-tags (flexi-streams:octets-to-string tags)) do
+          (loop for i in parsed-tags do
                 (sqlite:execute-non-query
                   *db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
                   (tagname-to-id i :create-if-missing t) cur-id))
@@ -583,19 +626,26 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
     (sqlite:execute-one-row-m-v
       *db* "select id, md5, creation_date, posted_by from posts where id=?" post-id)
     (when id
-      (format p "<p>id:~D md5:~A date:(~A) posted_by:~A tags:~{~S~^, ~}</p><img src=\"/imgs/~A\" alt=\"post image\">"
-              id md5 (print-date date)
-              (id-to-username by)
-              (collect-post-tags post-id)
+      (let ((username (or (id-to-username by) "~~")))
+        (format p "<p>id:~D md5:~A date:(~A) posted_by:<a href=\"/user/~A\">~A</a> tags:"
+                id md5 (print-date date)
+                (percent-encode username)
+                username))
+      (loop with first = t
+            for i in (collect-post-tags post-id)
+            if first do (setf first nil)
+            else do (format p ", ")
+            do (format p "<a href=\"/search?s=~A\">~S</a>"
+                       (percent-encode i) i))
+      (format p "</p><img src=\"/imgs/~A\" alt=\"post image\">"
               (image-orig-path md5)))))
 
 (defun page-display-comments (p post-id)
   (loop with stmt = (sqlite:prepare-statement *db* "select id, user, msg, date from comments where in_post=?")
         initially (sqlite:bind-parameter stmt 1 post-id)
         while (sqlite:step-statement stmt)
-        do (format p "<p class=\"comment-p\">comment id: ~D by user ~D:~A at ~A<br>~A</p>"
+        do (format p "<p class=\"comment-p\">comment id:~D by <a href=\"/user/~A\">~:*~A</a> at ~A<br>~A</p>"
                    (sqlite:statement-column-value stmt 0)
-                   (sqlite:statement-column-value stmt 1)
                    (id-to-username (sqlite:statement-column-value stmt 1))
                    (print-date (sqlite:statement-column-value stmt 3))
                    (escape-string (sqlite:statement-column-value stmt 2)))
@@ -704,8 +754,6 @@ having count(distinct tags_to_posts.tag_id) = :tag_count"
         finally (sqlite:finalize-statement stmt)))
 
 (defun page-search-list (p s page)
-  ;; TODO write caching
-  ;; TODO make it start from either the top or the bottom
   (let* ((page-begin (* page *posts-per-page*))
          (query-parsed (parse-tags s))
          (x (mapcar (lambda (name) (tagname-to-id name)) query-parsed)))
@@ -755,11 +803,56 @@ having count(distinct tags_to_posts.tag_id) = :tag_count"
           (loop for i from 0 to (floor (1- post-count) *posts-per-page*) do
                 (with-html-output (output)
                   (:li (:a :href (format nil "/search/?s=~A&p=~D" s i)
-                           (format output "[~D]" i))))))
-        (when error-text
-          (with-html-output (output)
-            (:p :class "note"
-                (format output "It appears that you have made an invalid request: ~A" error-text))))))))
+                           :class (when (= i page) "cur-page-link")
+                           (format output "~:[[~D]~;(~D)~]" (= i page) i)))))))
+      (format output "<p>~:[no~;~:*~D~] posts found.</p>" post-count)
+      (when error-text
+        (with-html-output (output)
+          (:p :class "note"
+              (format output "It appears that you have made an invalid request: ~A" error-text)))))))
+
+(defun page-list-tags (args)
+  (let* ((query-parsed (getf args :query-parsed))
+         (page-string (or (gethash "p" query-parsed) ""))
+         (page (or (parse-integer page-string :junk-allowed t)
+                   0)))
+    (simple-page
+      (:title "Tag list" :args args :output output)
+      (:ul
+        (loop with stmt = (sqlite:prepare-statement *db* "select name, id from tags order by name limit ? offset ?")
+              initially
+              (progn
+                (sqlite:bind-parameter stmt 1 *tags-per-page*)
+                (sqlite:bind-parameter stmt 2 (* page *tags-per-page*)))
+              while (sqlite:step-statement stmt)
+              do (format output "<li><a href=\"/search?s=~A\">~A</a> (id ~D)</li>"
+                         (percent-encode (sqlite:statement-column-value stmt 0))
+                         (sqlite:statement-column-value stmt 0)
+                         (sqlite:statement-column-value stmt 1))
+              finally (sqlite:finalize-statement stmt)))
+      (:ul :class "page-list"
+           (loop for i from 0 to (floor (sqlite:execute-single *db* "select count() from tags") *tags-per-page*)
+                 do (with-html-output (output)
+                      (:li (:a :href (format nil "/list-tags?p=~D" i)
+                               :class (when (= i page) "cur-page-link")
+                               (format output "~:[[~D]~;(~D)~]" (= i page) i)))))))))
+
+(defun page-user (args)
+  (let* ((path-s (getf args :path-s))
+         (username (second path-s))
+         (user-id (username-to-id username)))
+    (simple-page
+      (:output output
+       :title (format output "User ~A~:[(not found)~;~]" username user-id)
+       :args args)
+      (if user-id
+        (with-html-output (output)
+          (:p :class "note" "I dunno what to put here")
+          (:p (format output "This is user [<span class=\"username\">~A</span>][~D]." username user-id))
+          (:p "Maybe user description could be.")
+          (:p "A post/comment list? A pfp?"))
+        (with-html-output (output)
+          (:p :class "error" "User not found"))))))
 
 (defun valid-username-p (name)
   "Username is valid whenever it is at least 3 characters long and
@@ -896,7 +989,9 @@ consists only of Latin script, numerics, and any of [._-]"
   (simple-page
     (:title "Edit tags" :args args :output output)
     (let* ((id-s (second (getf args :path-s)))
-           (c (parse-integer (or id-s "") :junk-allowed t)))
+           (c (parse-integer (or id-s "") :junk-allowed t))
+           (query-parsed (parse-simple (getf args :query))))
+      (page-error-case output (gethash "e" query-parsed))
       (cond
         ((and c (post-exists c))
          (page-display-post output c)
@@ -920,7 +1015,8 @@ consists only of Latin script, numerics, and any of [._-]"
   (let* ((id-s (second (getf args :path-s)))
          (c (parse-integer (or id-s "") :junk-allowed t))
          (args-body-parsed (parse-simple (getf args :body)))
-         (tag-string (gethash "tags" args-body-parsed "")))
+         (tag-string (gethash "tags" args-body-parsed ""))
+         (tags-parsed (parse-tags (percent-decode tag-string))))
     (labels ((l-error
                (text)
                (return-from
@@ -934,9 +1030,11 @@ consists only of Latin script, numerics, and any of [._-]"
        (l-error "ci"))
       ((not tag-string)
        (l-error "ej"))
+      ((not (every #'valid-tagname-p tags-parsed))
+       (l-error "et"))
       (t
        (sqlite:execute-non-query *db* "delete from tags_to_posts where post_id=?" c)
-       (dolist (i (parse-tags (percent-decode tag-string)))
+       (dolist (i tags-parsed)
          (sqlite:execute-non-query
            *db* "insert into tags_to_posts (post_id, tag_id) values (?, ?)"
            c (tagname-to-id i :create-if-missing t)))
@@ -997,6 +1095,8 @@ consists only of Latin script, numerics, and any of [._-]"
 (defparameter *route-paths*
   '((page-home         :get  nil)
     (page-search       :get  ("search"))
+    (page-list-tags    :get  ("list-tags"))
+    (page-user         :get  ("user" :any))
     (page-post-form    :get  ("post"))
     (page-register     :get  ("register"))
     (page-login        :get  ("login"))

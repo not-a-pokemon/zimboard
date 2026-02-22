@@ -26,6 +26,11 @@ data whenever it is ASCII printable characters and whitespace. For separating
 tags, the string may be simply split by whitespace and commas. Non-ASCII
 characters *may* be supported, but it's not a requirement.
 
+Tag list: "/list-tags".
+Shall provide a list of tags. To not dump all the tags on the client, paginate
+the list. May provide facilities for regexp search (highly optional), substring
+search (suggested), and fuzzy search (optional).
+
 Register form: "/register".
 Shall provide a form, through which the user can ask the server to add a new
 user record. Any user validation method (including absence of any) is allowed.
