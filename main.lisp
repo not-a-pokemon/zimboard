@@ -20,7 +20,9 @@
     ("cache_tags" . "create table cache_tags (cache_id integer, tag_id integer)")
     ;; TODO should it be like that? Or the creation date rather would be better
     ;; left only where it already is?
-    ("cache_posts" . "create table cache_posts (cache_id integer, post_id integer, post_creation_date integer)")))
+    ("cache_posts" . "create table cache_posts (cache_id integer, post_id integer, post_creation_date integer)")
+    ;; action: 0 -> remove ; 1 -> add
+    ("tag_edits" . "create table tag_edits (post_id integer, tag_id integer, edited_by integer, date integer, action integer)")))
 
 (defvar *table-indices*
   '(("idx_tags_name" . "create index idx_tags_name on tags (name)")
@@ -33,7 +35,9 @@
     ("idx_cache_tags_by_cache" . "create index idx_cache_tags_by_cache on cache_tags (cache_id)")
     ("idx_cache_posts_by_cache" . "create index idx_cache_posts_by_cache on cache_posts (cache_id)")
     ("idx_cache_posts_by_post" . "create index idx_cache_posts_by_post on cache_posts (post_id)")
-    ("idx_cache_posts_by_date" . "create index idx_cache_posts_by_date on cache_posts (post_creation_date)")))
+    ("idx_cache_posts_by_date" . "create index idx_cache_posts_by_date on cache_posts (post_creation_date)")
+    ("idx_tag_edits_by_post" . "create index idx_tag_edits_by_post on tag_edits (post_id, date)")
+    ("idx_tag_edits_by_date" . "create index idx_tag_edits_by_date on tag_edits (date)")))
 
 (defvar *posts-per-page* 64)
 ;; TODO cache priority should probably be more complicated than simply LRU, but
@@ -43,6 +47,7 @@
   "A mode for development that responds with 'I'm a
 teapot' to every request coming outside of localhost")
 (defvar *tags-per-page* 128)
+(defvar *max-post-tags* 256)
 
 (defun table-exists-p (db name)
   (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
@@ -334,7 +339,8 @@ teapot' to every request coming outside of localhost")
     ("ci" . "Invalid post id")
     ("em" . "Must be logged in in order to edit tags")
     ("ej" . "Stop sending junk to the server, dumbass")
-    ("et" . "Invalid tagnames")))
+    ("et" . "Invalid tagnames")
+    ("el" . "Too many tagnames")))
 
 (defun page-error-case (output error-kind)
   (loop for i in *page-error-kinds*
@@ -526,6 +532,8 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
         (l-error "pn"))
       (unless (every #'valid-tagname-p parsed-tags)
         (l-error "et"))
+      (when (< *max-post-tags* (length parsed-tags))
+        (l-error "el"))
       (let* ((clean-body (or (magick-util:make-clean-blob (copy-seq image-body))
                              (l-error "pi")))
              (hash (array-to-hex (md5:md5sum-sequence clean-body))))
@@ -558,6 +566,12 @@ having count(cache_tags.tag_id) = count(case when cache_tags.tag_id in (~{~D~^,~
                   *db* "insert into tags_to_posts (tag_id, post_id) values (?, ?)"
                   (tagname-to-id i :create-if-missing t) cur-id))
           (update-cache cur-id)
+          (sqlite:execute-non-query/named
+            *db* "insert into tag_edits (post_id, tag_id, edited_by, date, action)
+select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts where post_id=:post_id"
+            ":post_id" cur-id
+            ":user_id" user-id
+            ":date" (get-universal-time))
           (sqlite:execute-non-query
             *db* "update posts set complete=1 where id=?" cur-id)
           `(303 (:content-type "text/plain" :location ,(format nil "/id/~D" cur-id))
@@ -972,7 +986,8 @@ consists only of Latin script, numerics, and any of [._-]"
      (cond
        ((and c (post-exists c))
         (with-html-output (output)
-          (:a :href (format nil "/id/~D/edit-tags" c) "Edit tags"))
+          (:a :href (format nil "/id/~D/edit-tags" c) "Edit tags") " "
+          (:a :href (format nil "/id/~D/hist" c) "History"))
         (page-display-post output c)
         (format output "<div class=\"comments\">")
         (page-display-comments output c)
@@ -984,6 +999,34 @@ consists only of Latin script, numerics, and any of [._-]"
        (t
         (with-html-output (output)
           (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
+
+(defun page-id-history (args)
+  (simple-page
+    (:title "Tag edit history" :args args :output output)
+    (let* ((id-s (second (getf args :path-s)))
+           (c (parse-integer (or id-s "") :junk-allowed t)))
+      (cond
+        ((and c (post-exists c))
+         (format output "<table><thead><th>Tag</th><th>User</th><th>Action</th><th>Date</th></thead>")
+         (loop with cnt = 0
+               with stmt = (sqlite:prepare-statement *db* "select tags.name, users.name, tag_edits.date, tag_edits.action from tag_edits join tags on tag_edits.tag_id=tags.id join users on tag_edits.edited_by=users.id where post_id=? order by tag_edits.date")
+               initially (sqlite:bind-parameter stmt 1 c)
+               while (sqlite:step-statement stmt) do
+               (progn
+                 (incf cnt)
+                 (format output "<tr><td>~A</td> <td>~A</td> <td>~A</td> <td>~A</td></tr>"
+                         (sqlite:statement-column-value stmt 0)
+                         (sqlite:statement-column-value stmt 1)
+                         (if (zerop (sqlite:statement-column-value stmt 3))
+                           "REMOVAL" "ADDITION")
+                         (print-date (sqlite:statement-column-value stmt 2))))
+               finally (when (zerop cnt)
+                         (format output "No tag edits here.")))
+         (format output "</table>")
+         )
+        (t
+          (with-html-output (output)
+            (:p :class "note" (format output "Some crap instead of pist id: ~S" id-s))))))))
 
 (defun page-id-edit-tags (args)
   (simple-page
@@ -1011,7 +1054,6 @@ consists only of Latin script, numerics, and any of [._-]"
            (:p :class "note" (format output "Some crap instead of post id: ~S" id-s))))))))
 
 (defun page-id-post-tags (args)
-  ;; TODO log the edit
   (let* ((id-s (second (getf args :path-s)))
          (c (parse-integer (or id-s "") :junk-allowed t))
          (args-body-parsed (parse-simple (getf args :body)))
@@ -1032,15 +1074,43 @@ consists only of Latin script, numerics, and any of [._-]"
        (l-error "ej"))
       ((not (every #'valid-tagname-p tags-parsed))
        (l-error "et"))
+      ((< *max-post-tags* (length tags-parsed))
+       (l-error "el"))
       (t
-       (sqlite:execute-non-query *db* "delete from tags_to_posts where post_id=?" c)
-       (dolist (i tags-parsed)
-         (sqlite:execute-non-query
-           *db* "insert into tags_to_posts (post_id, tag_id) values (?, ?)"
-           c (tagname-to-id i :create-if-missing t)))
-       (update-cache c)
-       `(303 (:location ,(format nil "/id/~D" c))
-         nil))))))
+       (let* ((tags-id (mapcar (lambda (x) (tagname-to-id x :create-if-missing t))
+                               tags-parsed))
+              (tags-add (loop for i in tags-id
+                              unless (sqlite:execute-single
+                                       *db* "select tag_id from tags_to_posts where post_id=? and tag_id=?" c i)
+                              collect i))
+              (current-time (get-universal-time))
+              (user (second (getf args :deduced-user))))
+         (sqlite:execute-non-query/named
+           *db* (format nil "insert into tag_edits (post_id, tag_id, edited_by, date, action)
+select :post_id, tag_id, :user_id, :date, 0 from tags_to_posts
+where post_id=:post_id and tag_id not in (~{~D~^,~})" tags-id)
+                        ":post_id" c
+                        ":user_id" user
+                        ":date" current-time)
+           (sqlite:execute-non-query/named
+             *db* "insert into tag_edits (post_id, tag_id, edited_by, date, action)
+select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts
+where post_id=:post_id and tag_id in ()"
+             ":post_id" c
+             ":user_id" user
+             ":date" current-time)
+           (sqlite:execute-non-query
+             *db* (format nil "delete from tags_to_posts where post_id=? and tag_id not in (~{~D~^,~})" tags-id)
+             c)
+           (dolist (i tags-add)
+             (sqlite:execute-non-query
+               *db* "insert into tags_to_posts (post_id, tag_id) values (?, ?)"
+               c i)
+             (sqlite:execute-non-query
+               *db* "insert into tag_edits (post_id, tag_id, edited_by, date, action) values (?, ?, ?, ?, 1)" c i user current-time))
+           (update-cache c)
+           `(303 (:location ,(format nil "/id/~D" c))
+             nil)))))))
 
 (defun page-post-comment (args)
   (let* ((parsed (parse-simple (getf args :body)))
@@ -1101,6 +1171,7 @@ consists only of Latin script, numerics, and any of [._-]"
     (page-register     :get  ("register"))
     (page-login        :get  ("login"))
     (page-id           :get  ("id" :any))
+    (page-id-history   :get  ("id" :any "hist"))
     (page-id-edit-tags :get  ("id" :any "edit-tags"))
     (page-id-post-tags :post ("id" :any "edit-tags"))
     (page-post-create  :post ("id"))
