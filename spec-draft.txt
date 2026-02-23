@@ -53,6 +53,10 @@ Page by id/edit tags: "/id/<number>/edit-tags".
 Shall provide a form, through which the user is able to submit a request to
 change the tagset of the post identified by <number>.
 
+Page by id/tag edit history: "/id/<number>/hist".
+Shall provide a complete list of tag edits made on the post identified by
+<number>. May be paginated.
+
 Comment: "<unspecified>", method POST.
 Can be accessible from the "Page by id" via a form. It is suggested that only
 registered users can comment. An implementation may be free to reject any

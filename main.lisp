@@ -3,11 +3,17 @@
 
 (in-package #:zimboard)
 
-(defvar *mem-db* (sqlite:connect "sqlite.db"))
+(defvar *port* 8080)
+(defvar *db-path* "sqlite.db")
+
+(defvar *mem-db* (sqlite:connect *db-path*))
 (defvar *db*)
 
 (defvar *tables*
   '(("users" . "create table users (id integer primary key, name text, passwd text)")
+    ;; TODO this may be not the best way to do rights (also naming)
+    ("user_rights" . "create table user_rights (id integer, action integer)")
+    ("users_pending" . "create table users_pending (id integer primary key, name text, passwd text)")
     ;; A session is described by its identifier - a string of 32 alphanumeric characters
     ;; The expiration date is in standard UNIX time
     ;; TODO Currently, session expiration isn't implemented
@@ -48,6 +54,9 @@
 teapot' to every request coming outside of localhost")
 (defvar *tags-per-page* 128)
 (defvar *max-post-tags* 256)
+
+;; Either :manual or :open
+(defvar *registration-mode* :manual)
 
 (defun table-exists-p (db name)
   (sqlite:execute-single db "select name from sqlite_master where type='table' and name=?" name))
@@ -314,7 +323,7 @@ teapot' to every request coming outside of localhost")
                              :href "/static/style.css"))
               `(:head))
              ,(if use-navbar
-                `(:body (page-navbar ,output (first (getf ,args :deduced-user)))
+                `(:body (page-navbar ,output (getf ,args :deduced-user))
                         ,(nconc (list :div :id "main")
                                 body))
                 (cons :body body))))))))
@@ -326,8 +335,10 @@ teapot' to every request coming outside of localhost")
 
 (defparameter *page-error-kinds*
   '(("i" . "Invalid username")
+    ("p" . "Empty password not allowed")
     ("x" . "User already exists")
     ("n" . "Passwords do not match")
+    ("s" . "Server error: unknown registration mode")
     ("lx" . "User doesn't exist")
     ("lp" . "Password incorrect")
     ("pi" . "Failed to parse image")
@@ -340,7 +351,10 @@ teapot' to every request coming outside of localhost")
     ("em" . "Must be logged in in order to edit tags")
     ("ej" . "Stop sending junk to the server, dumbass")
     ("et" . "Invalid tagnames")
-    ("el" . "Too many tagnames")))
+    ("el" . "Too many tagnames")
+    ("au" . "Need to be registered to approve others")
+    ("ai" . "Invalid request")
+    ("an" . "Pending user not found")))
 
 (defun page-error-case (output error-kind)
   (loop for i in *page-error-kinds*
@@ -364,13 +378,16 @@ teapot' to every request coming outside of localhost")
           (:a :class "nav-link" :href "/search" "Search") " "
           (:a :class "nav-link" :href "/post" "Make a post") " "
           (:a :class "nav-link" :href "/list-tags" "Tag list") " "
-          (if logged-as
+          (if (second logged-as)
             (with-html-output
               (p)
               (:span :class "nav-span"
-                     (format p "user/~A" logged-as)) " "
+                     (format p "user/~A" (first logged-as))) " "
               (:form :method "post" :action "/delete-session"
-                     (:input :class "nav-button" :type "submit" :value "Log out")))
+                     (:input :class "nav-button" :type "submit" :value "Log out"))
+              (when (approval-right-p (second logged-as))
+                (with-html-output (p)
+                  (:a :class "nav-link" :href "/approval" "Approval"))))
             (with-html-output
               (p)
               (:a :class "nav-link" :href "/register" "Register")
@@ -620,6 +637,54 @@ select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts where post_id=:po
                  (:td (:input :name "password" :id "paswd" :type "password")))
                (:tfoot
                  (:td (:input :type "submit" :value "Log in"))))))))
+
+(defun page-approval (args)
+  (simple-page
+    (:title "Approval" :args args :output output)
+    (:table
+      (page-error-case output (gethash "e" (getf args :query-parsed)))
+      (loop with empty = t
+            with stmt = (sqlite:prepare-statement *db* "select name, id from users_pending")
+            while (sqlite:step-statement stmt) do
+            (progn
+              (setf empty nil)
+              (format output "<tr><td>~A</td><td><form method=\"post\" action=\"/approval/~D\"><input type=\"submit\" value=\"Approve\"></form></td></tr>"
+                      (sqlite:statement-column-value stmt 0)
+                      (sqlite:statement-column-value stmt 1)))
+            finally (when empty
+                      (format output "<p class=\"note\">No approval requests</p>"))))))
+
+(defun approval-right-p (user-id)
+  (sqlite:execute-single *db* "select 1 from user_rights where action=0 and id=?" user-id))
+
+(defun page-approve-user (args)
+  (labels ((l-error (text)
+             (return-from
+               page-approve-user
+               `(303 (:content-type "text/plain"
+                      :location ,(format nil "/approval?e=~A" text))
+                 nil))))
+    (if (or (not (second (getf args :deduced-user)))
+            (not (approval-right-p (second (getf args :deduced-user)))))
+      (l-error "au"))
+    (let* ((id (or (parse-integer (second (getf args :path-s))
+                                  :junk-allowed t)
+                   (l-error "ai")))
+           (user-to-approve
+             (multiple-value-list
+               (sqlite:execute-one-row-m-v
+                 *db* "select name, passwd from users_pending where id=?" id))))
+      (unless (car user-to-approve)
+        (l-error "an"))
+      (sqlite:execute-non-query *db* "delete from users_pending where id=?" id)
+      (sqlite:execute-non-query
+        *db* "insert into users (name, passwd) values (?, ?)"
+        (first user-to-approve) (second user-to-approve))
+      (simple-page
+        (:title "Approval successful" :args args :output output)
+        (:p :class "note"
+            (format output "Confirmed registration for user (~A)"
+                    (first user-to-approve)))))))
 
 (defun tag-count (tag-id)
   (sqlite:execute-single *db* "select count(*) from tags_to_posts where post_id=?" tag-id))
@@ -892,6 +957,9 @@ consists only of Latin script, numerics, and any of [._-]"
 (defun page-post-user (args)
   (let ((c (parse-simple (getf args :body))))
     (cond
+      ((not (gethash "password" c))
+       (list 303 '(:content-type "text/plain" :location "/register?e=p")
+             '("Invalid username")))
       ((invalid-username-p (gethash "username" c))
        (list 303 '(:content-type "text/plain" :location "/register?e=i")
              '("Invalid username")))
@@ -902,13 +970,23 @@ consists only of Latin script, numerics, and any of [._-]"
                      (gethash "password1" c)))
        (list 303 '(:content-type "text/plain" :location "/register?e=n")
              '("Passwords not equal")))
+      ((eq *registration-mode* :open)
+       (sqlite:execute-non-query *db* "insert into users (name, passwd) values (?, ?)"
+                                 ;; TODO make this SHA256
+                                 (gethash "username" c) (array-to-hex (md5:md5sum-sequence (gethash "password" c))))
+       (simple-page
+         (:title "Account registered" :args args :output output)
+         (:p (format output "Account (~A) succesfully registered" (gethash "username" c)))))
+      ((eq *registration-mode* :manual)
+       (sqlite:execute-non-query *db* "insert into users_pending (name, passwd) values (?, ?)"
+                                 ;; TODO same, make this SHA256
+                                 (gethash "username" c) (array-to-hex (md5:md5sum-sequence (gethash "password" c))))
+       (simple-page
+         (:title "Account in manual approval queue" :args args :output output)
+         (:p (format output "Account (~A) is now waiting for approval" (gethash "username" c)))))
       (t
-        (sqlite:execute-non-query *db* "insert into users (name, passwd) values (?, ?)"
-                                  ;; TODO make this SHA256
-                                  (gethash "username" c) (array-to-hex (md5:md5sum-sequence (gethash "password" c))))
-        (simple-page
-          (:title "Account registered" :args args :output output)
-          (:p (format output "Account (~A) succesfully registered" (gethash "username" c))))))))
+        (list 303 '(:content-type "text/plain" :location "/register?e=s")
+              '("Server error: unknown registration mode"))))))
 
 (defun password-match-p (username password)
   ;; TODO replace md5 with SHA256
@@ -1170,6 +1248,8 @@ where post_id=:post_id and tag_id in ()"
     (page-post-form    :get  ("post"))
     (page-register     :get  ("register"))
     (page-login        :get  ("login"))
+    (page-approval     :get  ("approval"))
+    (page-approve-user :post ("approval" :any))
     (page-id           :get  ("id" :any))
     (page-id-history   :get  ("id" :any "hist"))
     (page-id-edit-tags :get  ("id" :any "edit-tags"))
@@ -1232,7 +1312,7 @@ where post_id=:post_id and tag_id in ()"
 
 (defun page-with-db-entry (env)
   ;; TODO move the connection so it runs only once per thread
-  (let ((*db* (sqlite:connect "sqlite.db")))
+  (let ((*db* (sqlite:connect *db-path*)))
     (unwind-protect
       (page-entry env)
       (sqlite:disconnect *db*))))
@@ -1284,7 +1364,7 @@ where post_id=:post_id and tag_id in ()"
   (when *acceptor*
     (hunchentoot:stop *acceptor*))
   ;; NOTE Can add :taskmaster (make-instance 'hunchentoot:single-threaded-taskmaster) to get single threading
-  (setf *acceptor* (hunchentoot:start (make-instance 'my-acceptor :port 8080))))
+  (setf *acceptor* (hunchentoot:start (make-instance 'my-acceptor :port *port*))))
 
 (defun stop-server ()
   (hunchentoot:stop *acceptor*))
