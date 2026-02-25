@@ -1,6 +1,28 @@
 The *draft* of the API/HTML specification.
 
-Short description on paths that must be possible to access.
+|General information|
+
+A *post* is an image which has some (possibly none) associated tagnames.
+Tagnames can be used to search matching posts.
+Possible search kinds:
+- "<tag>": The post must have the <tag>.
+- "X<tag>": The post must not have the <tag>. Only affects page display, and
+  should not accounted for in the query builder or whatever actually performs
+the searches.
+- "!<tag>": The post must not have the <tag>.
+- "user:<name>" (a special kind of tag): The post must have been uploaded by
+  user <name>.
+Advanced search syntax:
+- "[<tag1> <tag2> ... <tagN>]": The post must contain at least one of the listed
+  tags.
+
+(TODO Currently, zimboard doesn't have any of these implemented besides the
+simplest one)
+
+A valid tagname only consists of lowercase Latin characters, numerics, and the
+following: ._-()'%~
+
+|Short description on paths that must be possible to access|
 
 Home: "/".
 Can be anything but it is recommended to provide navigation links,
@@ -70,7 +92,7 @@ Logout: "<unspecified>", method POST.
 Such a request shall mark the current user session invalid, effectively logging
 the session user out. Optionally, reset the cookie on the client.
 
-Suggested database description.
+|Suggested database description|
 
 It's preferable to use an SQL database.
 In such case, it must include the following tables:

@@ -10,7 +10,7 @@
 
 (cffi:use-foreign-library magick-util-lib)
 
-; TODO run zi_init and zi_uninit where appropriate
+; TODO run zi_init and zi_uninit where appropriate (Or I should rather not?)
 
 (defun make-clean-blob (buf)
   (declare (type (simple-array (unsigned-byte 8)) buf))

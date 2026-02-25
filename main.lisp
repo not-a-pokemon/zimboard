@@ -1,5 +1,6 @@
 (defpackage #:zimboard
-  (:use #:cl #:cl-who))
+  (:use #:cl)
+  (:import-from #:cl-who with-html-output with-html-output-to-string))
 
 (in-package #:zimboard)
 
@@ -97,6 +98,9 @@ teapot' to every request coming outside of localhost")
 (defun latin-char-p (c)
   (or (<= (char-code #\a) (char-code c) (char-code #\z))
       (<= (char-code #\A) (char-code c) (char-code #\Z))))
+
+(defun latin-lowcase-char-p (c)
+  (<= (char-code #\a) (char-code c) (char-code #\z)))
 
 (defun numer-char-p (c)
   (<= (char-code #\0) (char-code c) (char-code #\9)))
@@ -339,6 +343,7 @@ teapot' to every request coming outside of localhost")
     ("x" . "User already exists")
     ("n" . "Passwords do not match")
     ("s" . "Server error: unknown registration mode")
+    ("t" . "Username already in pending queue")
     ("lx" . "User doesn't exist")
     ("lp" . "Password incorrect")
     ("pi" . "Failed to parse image")
@@ -457,7 +462,7 @@ teapot' to every request coming outside of localhost")
 
 (defun valid-tagname-p (name)
   (loop for i across name
-        always (or (latin-char-p i)
+        always (or (latin-lowcase-char-p i)
                    (numer-char-p i)
                    (case i
                      (#\. t)
@@ -727,7 +732,7 @@ select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts where post_id=:po
                    (sqlite:statement-column-value stmt 0)
                    (id-to-username (sqlite:statement-column-value stmt 1))
                    (print-date (sqlite:statement-column-value stmt 3))
-                   (escape-string (sqlite:statement-column-value stmt 2)))
+                   (cl-who:escape-string (sqlite:statement-column-value stmt 2)))
         finally (sqlite:finalize-statement stmt)))
 
 (defun page-display-post-preview (p post-id)
@@ -869,7 +874,7 @@ having count(distinct tags_to_posts.tag_id) = :tag_count"
       (:form :action "/search"
              (:label :for "s" "Search string: ")
              (:input :id "s" :name "s" :type "text" :placeholder "empty"
-                     :value (escape-string s)))
+                     :value (cl-who:escape-string s)))
       (:div :id "post-list"
             (multiple-value-setq (post-count error-text)
               (page-search-list output s page)))
@@ -958,14 +963,15 @@ consists only of Latin script, numerics, and any of [._-]"
   (let ((c (parse-simple (getf args :body))))
     (cond
       ((not (gethash "password" c))
-       (list 303 '(:content-type "text/plain" :location "/register?e=p")
-             '("Invalid username")))
+       '(303 (:content-type "text/plain" :location "/register?e=p") nil))
       ((invalid-username-p (gethash "username" c))
-       (list 303 '(:content-type "text/plain" :location "/register?e=i")
-             '("Invalid username")))
+       '(303 (:content-type "text/plain" :location "/register?e=i") nil))
       ((username-to-id (gethash "username" c))
-       (list 303 '(:content-type "text/plain" :location "/register?e=x")
-             '("Username already exists")))
+       '(303 (:content-type "text/plain" :location "/register?e=x") nil))
+      ((sqlite:execute-single
+         *db* "select 1 from users_pending where name=?"
+         (gethash "username" c))
+       '(303 (:content-type "text/plain" :location "/register?e=t") nil))
       ((not (string= (gethash "password" c)
                      (gethash "password1" c)))
        (list 303 '(:content-type "text/plain" :location "/register?e=n")
