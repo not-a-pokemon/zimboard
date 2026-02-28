@@ -141,42 +141,44 @@ teapot' to every request coming outside of localhost")
 
 
 (defun percent-decode (str)
-  (with-output-to-string (result)
-    (let ((i 0)
-          (len (length str)))
-      (loop while (< i len) do
-            (let ((c (char str i)))
-              (cond
-                ((char= #\% c)
-                 (if (< (+ i 2) len)
-                   (let ((c1 (hex-to-int (char str (+ 1 i)) nil))
-                         (c2 (hex-to-int (char str (+ 2 i)) nil)))
-                     (when (and c1 c2)
-                       (write-char (code-char (+ c2 (* 16 c1))) result))
-                     (incf i 3))
-                   (incf i)))
-                ((char= #\+ c)
-                 (write-char #\Space result)
-                 (incf i))
-                (t
-                  (write-char c result)
-                  (incf i))))))))
+  (let ((i 0)
+        (len (length str))
+        (result (make-array 0 :element-type '(unsigned-byte 8) :fill-pointer 0)))
+    (loop while (< i len) do
+          (let ((c (char str i)))
+            (cond
+              ((char= #\% c)
+               (if (< (+ i 2) len)
+                 (let ((c1 (hex-to-int (char str (+ 1 i)) nil))
+                       (c2 (hex-to-int (char str (+ 2 i)) nil)))
+                   (when (and c1 c2)
+                     (vector-push-extend (+ c2 (* 16 c1)) result))
+                   (incf i 3))
+                 (incf i)))
+              ((char= #\+ c)
+               (vector-push-extend (char-code #\Space) result)
+               (incf i))
+              (t
+                (vector-push-extend (char-code c) result)
+                (incf i)))))
+    (flexi-streams:octets-to-string result :external-format :utf-8)))
 
 (defvar *percent-non-encoded* "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_~.")
+(defvar *percent-non-encoded-1* (map 'vector #'(lambda (x) (char-code x)) *percent-non-encoded*))
 (defun percent-encode (str)
   ;; TODO perf
   (with-output-to-string (result)
-    (loop for i across str do
+    (loop for i across (flexi-streams:string-to-octets str :external-format :utf-8) do
           (cond
-            ((position i *percent-non-encoded*)
-             (write-char i result))
-            ((char= #\Space i)
+            ((position i *percent-non-encoded-1*)
+             (write-char (code-char i) result))
+            ((= (char-code #\Space) i)
              (write-char #\+ result))
             (t
               (write-char #\% result)
-              (write-char (int-to-hex-upcase (ash (char-code i) -4))
+              (write-char (int-to-hex-upcase (ash i -4))
                           result)
-              (write-char (int-to-hex-upcase (logand #xF (char-code i)))
+              (write-char (int-to-hex-upcase (logand #xF i))
                           result))))
     result))
 
@@ -300,6 +302,7 @@ teapot' to every request coming outside of localhost")
                 finally (progn (finish (length l)) (return r)))))
       (make-hash-table :test #'equal))))
 
+;; NOTE that this macro evaluates its arguments in any order it wants; TODO fix it
 (defmacro simple-page (head &rest body)
   (declare (type list head))
   (let ((status (getf head :status 200))
@@ -648,14 +651,16 @@ select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts where post_id=:po
     (:title "Approval" :args args :output output)
     (:table
       (page-error-case output (gethash "e" (getf args :query-parsed)))
-      (loop with empty = t
+      (loop with inactive = (not (approval-right-p (second (getf args :deduced-user))))
+            with empty = t
             with stmt = (sqlite:prepare-statement *db* "select name, id from users_pending")
             while (sqlite:step-statement stmt) do
             (progn
               (setf empty nil)
-              (format output "<tr><td>~A</td><td><form method=\"post\" action=\"/approval/~D\"><input type=\"submit\" value=\"Approve\"></form></td></tr>"
+              (format output "<tr><td>~A</td><td><form method=\"post\" action=\"/approval/~D\"><input type=\"submit\" value=\"Approve\"~:[~; disabled~]></form></td></tr>"
                       (sqlite:statement-column-value stmt 0)
-                      (sqlite:statement-column-value stmt 1)))
+                      (sqlite:statement-column-value stmt 1)
+                      inactive))
             finally (when empty
                       (format output "<p class=\"note\">No approval requests</p>"))))))
 
@@ -731,7 +736,7 @@ select :post_id, tag_id, :user_id, :date, 1 from tags_to_posts where post_id=:po
         do (format p "<p class=\"comment-p\">comment id:~D by <a href=\"/user/~A\">~:*~A</a> at ~A<br>~A</p>"
                    (sqlite:statement-column-value stmt 0)
                    (id-to-username (sqlite:statement-column-value stmt 1))
-                   (print-date (sqlite:statement-column-value stmt 3))
+                   (print-date (or (sqlite:statement-column-value stmt 3) 0))
                    (cl-who:escape-string (sqlite:statement-column-value stmt 2)))
         finally (sqlite:finalize-statement stmt)))
 
@@ -840,7 +845,7 @@ having count(distinct tags_to_posts.tag_id) = :tag_count"
 (defun page-search-list (p s page)
   (let* ((page-begin (* page *posts-per-page*))
          (query-parsed (parse-tags s))
-         (x (mapcar (lambda (name) (tagname-to-id name)) query-parsed)))
+         (x (mapcar #'(lambda (name) (tagname-to-id name)) query-parsed)))
     (cond
       ((some #'null x)
        (values
@@ -1161,7 +1166,7 @@ consists only of Latin script, numerics, and any of [._-]"
       ((< *max-post-tags* (length tags-parsed))
        (l-error "el"))
       (t
-       (let* ((tags-id (mapcar (lambda (x) (tagname-to-id x :create-if-missing t))
+       (let* ((tags-id (mapcar #'(lambda (x) (tagname-to-id x :create-if-missing t))
                                tags-parsed))
               (tags-add (loop for i in tags-id
                               unless (sqlite:execute-single
@@ -1221,8 +1226,8 @@ where post_id=:post_id and tag_id in ()"
 (defun static-directory (args)
   ;; TODO figure out a more safe/better way to serve files
   ;; TODO figure out if I even need this crap
-  (when (notany (lambda (x) (or (string= "." x)
-                                (string= ".." x)))
+  (when (notany #'(lambda (x) (or (string= "." x)
+                                  (string= ".." x)))
                 (getf args :path-s))
     (pathname (format nil "./~{~A~^/~}" (getf args :path-s)))))
 
